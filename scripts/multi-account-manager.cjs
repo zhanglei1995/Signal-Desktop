@@ -35,6 +35,9 @@ const logs = new Map();
 
 let mainWindow;
 let broadcastTimer;
+let viewportRequestTimer;
+let viewportBounds;
+let activeAccountId;
 
 function loadAccounts() {
   let config = {};
@@ -168,6 +171,62 @@ function scheduleBroadcast() {
   broadcastTimer = setTimeout(broadcast, 100);
 }
 
+function requestViewportBounds() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return;
+  }
+
+  clearTimeout(viewportRequestTimer);
+  viewportRequestTimer = setTimeout(() => {
+    mainWindow.webContents.send('manager:viewport-request');
+  }, 80);
+}
+
+function setViewportBounds(rect) {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return getSnapshot();
+  }
+
+  const x = Number(rect?.x);
+  const y = Number(rect?.y);
+  const width = Number(rect?.width);
+  const height = Number(rect?.height);
+
+  if (
+    !Number.isFinite(x) ||
+    !Number.isFinite(y) ||
+    !Number.isFinite(width) ||
+    !Number.isFinite(height) ||
+    width < 1 ||
+    height < 1
+  ) {
+    return getSnapshot();
+  }
+
+  const contentBounds = mainWindow.getContentBounds();
+  const nextBounds = {
+    x: Math.round(contentBounds.x + x),
+    y: Math.round(contentBounds.y + y),
+    width: Math.round(width),
+    height: Math.round(height),
+  };
+
+  const changed =
+    !viewportBounds ||
+    viewportBounds.x !== nextBounds.x ||
+    viewportBounds.y !== nextBounds.y ||
+    viewportBounds.width !== nextBounds.width ||
+    viewportBounds.height !== nextBounds.height;
+
+  viewportBounds = nextBounds;
+
+  if (changed) {
+    syncActiveAccountWindow({ focus: false });
+  }
+
+  return getSnapshot();
+}
+
 function startAccount(id) {
   const existing = processes.get(id);
   if (existing?.status === 'running') {
@@ -226,6 +285,8 @@ function startAccount(id) {
   });
 
   scheduleBroadcast();
+  activeAccountId = id;
+  scheduleAttachAttempts(id);
   return getSnapshot();
 }
 
@@ -268,7 +329,140 @@ function getExpectedWindowTitle(account) {
   return `Signal - development - ${account.id}`;
 }
 
-function focusAccount(id) {
+function runPowerShell(command) {
+  const child = spawn(
+    'powershell.exe',
+    ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command],
+    {
+      windowsHide: true,
+      stdio: 'ignore',
+    }
+  );
+
+  child.on('error', () => {});
+}
+
+function getWin32WindowToolsCommand() {
+  return `
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class SignalManagerWindowTools {
+  private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+  [DllImport("user32.dll")]
+  private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+  [DllImport("user32.dll")]
+  private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+  [DllImport("user32.dll")]
+  private static extern bool IsWindowVisible(IntPtr hWnd);
+
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+  private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+  private static extern int GetWindowTextLength(IntPtr hWnd);
+
+  [DllImport("user32.dll")]
+  public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+
+  [DllImport("user32.dll")]
+  public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+  [DllImport("user32.dll")]
+  public static extern bool SetWindowPos(
+    IntPtr hWnd,
+    IntPtr hWndInsertAfter,
+    int X,
+    int Y,
+    int cx,
+    int cy,
+    uint uFlags
+  );
+
+  public static IntPtr FindWindow(int processId, string expectedTitle) {
+    IntPtr fallback = IntPtr.Zero;
+
+    EnumWindows((hWnd, lParam) => {
+      uint windowProcessId;
+      GetWindowThreadProcessId(hWnd, out windowProcessId);
+      if ((int)windowProcessId != processId || !IsWindowVisible(hWnd)) {
+        return true;
+      }
+
+      int length = GetWindowTextLength(hWnd);
+      if (length <= 0) {
+        return true;
+      }
+
+      var title = new StringBuilder(length + 1);
+      GetWindowText(hWnd, title, title.Capacity);
+      string value = title.ToString();
+
+      if (string.Equals(value, expectedTitle, StringComparison.OrdinalIgnoreCase)) {
+        fallback = hWnd;
+        return false;
+      }
+
+      if (fallback == IntPtr.Zero) {
+        fallback = hWnd;
+      }
+
+      return true;
+    }, IntPtr.Zero);
+
+    return fallback;
+  }
+}
+'@
+`;
+}
+
+function getWin32AttachCommand(account, entry, bounds, { focus }) {
+  const flags = focus ? '0x0040' : '(0x0040 -bor 0x0010)';
+
+  return `${getWin32WindowToolsCommand()}
+$hWnd = [SignalManagerWindowTools]::FindWindow(${entry.child.pid}, ${quotePowerShellString(
+    getExpectedWindowTitle(account)
+  )});
+
+if ($hWnd -ne [IntPtr]::Zero) {
+  [SignalManagerWindowTools]::ShowWindowAsync($hWnd, 9) | Out-Null;
+  [SignalManagerWindowTools]::SetWindowPos(
+    $hWnd,
+    [IntPtr]::Zero,
+    ${bounds.x},
+    ${bounds.y},
+    ${bounds.width},
+    ${bounds.height},
+    ${flags}
+  ) | Out-Null;
+  ${
+    focus
+      ? '[SignalManagerWindowTools]::SetForegroundWindow($hWnd) | Out-Null;'
+      : ''
+  }
+}
+`;
+}
+
+function getWin32MinimizeCommand(account, entry) {
+  return `${getWin32WindowToolsCommand()}
+$hWnd = [SignalManagerWindowTools]::FindWindow(${entry.child.pid}, ${quotePowerShellString(
+    getExpectedWindowTitle(account)
+  )});
+
+if ($hWnd -ne [IntPtr]::Zero) {
+  [SignalManagerWindowTools]::ShowWindowAsync($hWnd, 6) | Out-Null;
+}
+`;
+}
+
+function focusAccountFallback(id) {
   const account = getAccount(id);
 
   if (process.platform === 'win32') {
@@ -280,14 +474,7 @@ function focusAccount(id) {
       `$null = $shell.AppActivate(${quotePowerShellString('Signal')})`,
     ].join('; ');
 
-    spawn(
-      'powershell.exe',
-      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command],
-      {
-        windowsHide: true,
-        stdio: 'ignore',
-      }
-    );
+    runPowerShell(command);
   } else if (process.platform === 'darwin') {
     spawn('osascript', ['-e', 'tell application "Signal" to activate'], {
       stdio: 'ignore',
@@ -295,6 +482,64 @@ function focusAccount(id) {
   }
 
   return getSnapshot();
+}
+
+function hideInactiveAccountWindows(id) {
+  if (process.platform !== 'win32') {
+    return;
+  }
+
+  for (const [accountId, entry] of processes) {
+    if (accountId === id || entry.status !== 'running') {
+      continue;
+    }
+
+    runPowerShell(getWin32MinimizeCommand(getAccount(accountId), entry));
+  }
+}
+
+function attachAccount(id, options = {}) {
+  activeAccountId = id;
+  hideInactiveAccountWindows(id);
+
+  const entry = processes.get(id);
+  if (!entry || entry.status !== 'running') {
+    return getSnapshot();
+  }
+
+  if (process.platform !== 'win32' || !viewportBounds) {
+    return focusAccountFallback(id);
+  }
+
+  runPowerShell(
+    getWin32AttachCommand(getAccount(id), entry, viewportBounds, {
+      focus: options.focus !== false,
+    })
+  );
+
+  return getSnapshot();
+}
+
+function syncActiveAccountWindow(options = {}) {
+  if (!activeAccountId) {
+    return getSnapshot();
+  }
+
+  return attachAccount(activeAccountId, options);
+}
+
+function scheduleAttachAttempts(id) {
+  [600, 1600, 3200, 5200].forEach(delay => {
+    setTimeout(() => {
+      if (activeAccountId === id) {
+        attachAccount(id, { focus: delay >= 1600 });
+      }
+    }, delay);
+  });
+}
+
+function focusAccount(id) {
+  return attachAccount(id, { focus: true });
 }
 
 function openProfileConfig(id) {
@@ -329,6 +574,21 @@ function createWindow() {
   mainWindow.loadURL(
     pathToFileURL(join(__dirname, 'multi-account-manager.html')).toString()
   );
+
+  mainWindow.webContents.once('did-finish-load', requestViewportBounds);
+  mainWindow.on('move', requestViewportBounds);
+  mainWindow.on('resize', requestViewportBounds);
+  mainWindow.on('restore', () => {
+    requestViewportBounds();
+    syncActiveAccountWindow({ focus: false });
+  });
+  mainWindow.on('minimize', () => {
+    for (const [id, entry] of processes) {
+      if (entry.status === 'running') {
+        runPowerShell(getWin32MinimizeCommand(getAccount(id), entry));
+      }
+    }
+  });
 }
 
 ipcMain.handle('manager:get-state', () => getSnapshot());
@@ -336,6 +596,10 @@ ipcMain.handle('manager:start', (_event, id) => startAccount(id));
 ipcMain.handle('manager:stop', (_event, id) => stopAccount(id));
 ipcMain.handle('manager:restart', (_event, id) => restartAccount(id));
 ipcMain.handle('manager:focus', (_event, id) => focusAccount(id));
+ipcMain.handle('manager:attach', (_event, id) => attachAccount(id));
+ipcMain.handle('manager:set-viewport-bounds', (_event, rect) =>
+  setViewportBounds(rect)
+);
 ipcMain.handle('manager:ensure-config', (_event, id) => {
   ensureProfileConfig(getAccount(id));
   return getSnapshot();

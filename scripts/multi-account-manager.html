@@ -129,6 +129,7 @@
       .main {
         display: grid;
         grid-template-rows: auto 1fr;
+        overflow: hidden;
       }
 
       .summary {
@@ -190,20 +191,29 @@
         opacity: 0.55;
       }
 
-      .log {
+      .viewport {
+        position: relative;
         min-height: 0;
-        margin: 0;
-        overflow: auto;
-        padding: 14px 18px;
-        background: #0f172a;
-        color: #dbeafe;
-        font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
-        white-space: pre-wrap;
+        overflow: hidden;
+        background: #111827;
+      }
+
+      .viewport-target {
+        position: absolute;
+        inset: 0;
+      }
+
+      .viewport-placeholder {
+        display: grid;
+        place-items: center;
+        height: 100%;
+        color: #cbd5e1;
+        font-size: 13px;
       }
 
       .side {
         display: grid;
-        grid-template-rows: auto 1fr;
+        grid-template-rows: auto minmax(120px, 220px) auto minmax(0, 1fr);
         overflow: hidden;
       }
 
@@ -217,6 +227,18 @@
       .accounts {
         overflow: auto;
         padding: 8px;
+      }
+
+      .log {
+        min-height: 0;
+        margin: 0;
+        overflow: auto;
+        padding: 12px;
+        border-top: 1px solid var(--line);
+        background: #0f172a;
+        color: #dbeafe;
+        font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+        white-space: pre-wrap;
       }
 
       .account-row {
@@ -270,6 +292,8 @@
         <aside class="side">
           <h2>Accounts</h2>
           <div class="accounts" id="accounts"></div>
+          <h2>Log</h2>
+          <pre class="log" id="accountLog"></pre>
         </aside>
       </main>
     </div>
@@ -278,6 +302,7 @@
       const api = window.multiAccountManager;
       let state = { accounts: [] };
       let activeId;
+      let viewportSyncTimer;
 
       function getActiveAccount() {
         return (
@@ -297,10 +322,27 @@
       function selectAccount(id) {
         activeId = id;
         render();
-        const account = getActiveAccount();
-        if (account?.status === 'running') {
-          api.focus(id);
+        api.attach(id);
+      }
+
+      function syncViewportBounds() {
+        const viewport = document.getElementById('signalViewport');
+        if (!viewport) {
+          return;
         }
+
+        const rect = viewport.getBoundingClientRect();
+        api.setViewportBounds({
+          x: rect.x,
+          y: rect.y,
+          width: rect.width,
+          height: rect.height,
+        });
+      }
+
+      function scheduleViewportSync() {
+        clearTimeout(viewportSyncTimer);
+        viewportSyncTimer = setTimeout(syncViewportBounds, 50);
       }
 
       function statusClass(status) {
@@ -361,8 +403,6 @@
           return;
         }
 
-        const logText =
-          account.log.length > 0 ? account.log.join('\n') : 'No log output yet.';
         main.innerHTML = `
           <div class="summary">
             <h1></h1>
@@ -375,8 +415,8 @@
               <span>User data: <code></code></span>
             </div>
             <div class="actions">
-              <button class="primary" id="startBtn">Start / Focus</button>
-              <button id="focusBtn">Focus</button>
+              <button class="primary" id="startBtn">Start / Attach</button>
+              <button id="focusBtn">Attach</button>
               <button id="restartBtn">Restart</button>
               <button class="danger" id="stopBtn">Stop</button>
               <button id="ensureBtn">Create config</button>
@@ -384,7 +424,12 @@
               <button id="dataBtn">Open data folder</button>
             </div>
           </div>
-          <pre class="log"></pre>
+          <div class="viewport">
+            <div class="viewport-placeholder">
+              ${account.status === 'running' ? 'Attaching window' : 'Stopped'}
+            </div>
+            <div class="viewport-target" id="signalViewport"></div>
+          </div>
         `;
 
         main.querySelector('h1').textContent = account.label;
@@ -393,14 +438,16 @@
         codes[3].textContent = account.storageProfile;
         codes[4].textContent = account.profileConfigPath;
         codes[5].textContent = account.userDataPath;
-        main.querySelector('.log').textContent = logText;
 
         main
           .querySelector('#startBtn')
-          .addEventListener('click', () => api.start(account.id));
+          .addEventListener('click', async () => {
+            setState(await api.start(account.id));
+            await api.attach(account.id);
+          });
         main
           .querySelector('#focusBtn')
-          .addEventListener('click', () => api.focus(account.id));
+          .addEventListener('click', () => api.attach(account.id));
         main
           .querySelector('#restartBtn')
           .addEventListener('click', () => api.restart(account.id));
@@ -416,12 +463,24 @@
         main
           .querySelector('#dataBtn')
           .addEventListener('click', () => api.openDataPath(account.id));
+
+        requestAnimationFrame(scheduleViewportSync);
+      }
+
+      function renderLog() {
+        const log = document.getElementById('accountLog');
+        const account = getActiveAccount();
+        log.textContent =
+          account && account.log.length > 0
+            ? account.log.join('\n')
+            : 'No log output yet.';
       }
 
       function render() {
         renderTabs();
         renderMain();
         renderAccounts();
+        renderLog();
       }
 
       document
@@ -431,6 +490,8 @@
         .getElementById('openManagerConfig')
         .addEventListener('click', () => api.openManagerConfig());
 
+      window.addEventListener('resize', scheduleViewportSync);
+      api.onViewportRequest(syncViewportBounds);
       api.onState(setState);
       api.getState().then(setState);
     </script>
