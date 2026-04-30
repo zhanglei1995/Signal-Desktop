@@ -36,6 +36,7 @@
     "format:c": "xcrun clang-format --style=chromium -Werror --verbose -i *.mm"
   },
   "devDependencies": {
+    "node-gyp": "12.3.0",
     "prettier": "3.6.2"
   }
 }

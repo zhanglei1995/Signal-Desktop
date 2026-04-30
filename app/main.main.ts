@@ -1,7 +1,14 @@
 // Copyright 2017 Signal Messenger, LLC
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { join, normalize, extname, dirname, basename } from 'node:path';
+import {
+  join,
+  normalize,
+  extname,
+  dirname,
+  basename,
+  resolve,
+} from 'node:path';
 import { pathToFileURL } from 'node:url';
 import * as os from 'node:os';
 import fsExtra from 'fs-extra';
@@ -2633,23 +2640,63 @@ app.on(
   }
 );
 
-if (!app.isDefaultProtocolClient('sgnl')) {
-  log.info('setting signal as the default app for the sgnl url scheme');
-  app.setAsDefaultProtocolClient('sgnl');
-} else {
-  log.info(
-    'signal is already registered as the default app for the sgnl url scheme.'
+type ProtocolClient = 'sgnl' | 'signalcaptcha';
+
+function getProtocolClientRegistration():
+  | { path: string; args: Array<string> }
+  | undefined {
+  if (app.isPackaged) {
+    return undefined;
+  }
+
+  const appPath = process.argv[1];
+  if (!appPath) {
+    return undefined;
+  }
+
+  return {
+    path: process.execPath,
+    args: [resolve(appPath)],
+  };
+}
+
+function isRegisteredForProtocol(protocol: ProtocolClient): boolean {
+  const registration = getProtocolClientRegistration();
+  if (!registration) {
+    return app.isDefaultProtocolClient(protocol);
+  }
+
+  return app.isDefaultProtocolClient(
+    protocol,
+    registration.path,
+    registration.args
   );
 }
-if (!app.isDefaultProtocolClient('signalcaptcha')) {
-  log.info(
-    'setting signal as the default app for the signalcaptcha url scheme'
+
+function registerForProtocol(protocol: ProtocolClient): boolean {
+  const registration = getProtocolClientRegistration();
+  if (!registration) {
+    return app.setAsDefaultProtocolClient(protocol);
+  }
+
+  return app.setAsDefaultProtocolClient(
+    protocol,
+    registration.path,
+    registration.args
   );
-  app.setAsDefaultProtocolClient('signalcaptcha');
-} else {
-  log.info(
-    'signal is already registered as the default app for the sgnl url scheme.'
-  );
+}
+
+for (const protocol of ['sgnl', 'signalcaptcha'] as const) {
+  if (!isRegisteredForProtocol(protocol)) {
+    log.info(
+      `setting signal as the default app for the ${protocol} url scheme`
+    );
+    registerForProtocol(protocol);
+  } else {
+    log.info(
+      `signal is already registered as the default app for the ${protocol} url scheme.`
+    );
+  }
 }
 
 ipc.on(
