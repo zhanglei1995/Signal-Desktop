@@ -1,0 +1,19 @@
+{
+  "accounts": [
+    {
+      "id": "alice",
+      "label": "Alice",
+      "storageProfile": "aliceProfile"
+    },
+    {
+      "id": "bob",
+      "label": "Bob",
+      "storageProfile": "bobProfile"
+    },
+    {
+      "id": "work",
+      "label": "Work",
+      "storageProfile": "workProfile"
+    }
+  ]
+}
