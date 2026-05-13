@@ -5,6 +5,12 @@ import type { MenuItemConstructorOptions } from 'electron';
 
 export type MenuListType = Array<MenuItemConstructorOptions>;
 
+export type AccountMenuItemType = Readonly<{
+  id: string;
+  label: string;
+  accelerator?: string;
+}>;
+
 export type MenuOptionsType = Readonly<{
   development: boolean;
   devTools: boolean;
@@ -28,6 +34,7 @@ export type MenuActionsType = Readonly<{
   showDebugLog: () => unknown;
   showKeyboardShortcuts: () => unknown;
   showSettings: () => unknown;
+  showAccount: (id: string) => unknown;
   showWindow: () => unknown;
   stageLocalBackupForImport: () => unknown;
   zoomIn: () => unknown;

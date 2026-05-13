@@ -7,7 +7,7 @@ import {
   extname,
   dirname,
   basename,
-  resolve,
+  resolve as resolvePath,
 } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import * as os from 'node:os';
@@ -104,6 +104,18 @@ import {
   isContentProtectionEnabledByDefault,
 } from '../ts/types/Settings.std.ts';
 import * as ephemeralConfig from './ephemeral_config.main.ts';
+import {
+  createAccountRuntime,
+  type AccountRuntime,
+  getAccountRuntimeById,
+  getAccountRuntimeForEvent,
+  getPrimaryAccountRuntime,
+  registerAccountRuntime,
+  registerAccountWindow,
+  registerPrimaryAccountRuntime,
+  setAccountRuntimeForWindow,
+} from './account_runtime.std.ts';
+import { start as startConfig } from './base_config.node.ts';
 import * as mainProcessLogging from '../ts/logging/main_process_logging.main.ts';
 import { MainSQL } from '../ts/sql/main.main.ts';
 import * as sqlChannels from './sql_channel.main.ts';
@@ -145,7 +157,7 @@ import { appRelaunch } from '../ts/util/relaunch.main.ts';
 import { getAppRootDir } from '../ts/util/appRootDir.main.ts';
 import { sendDummyKeystroke } from './WindowsNotifications.main.ts';
 
-const { chmod, realpath, writeFile } = fsExtra;
+const { chmod, ensureDir, realpath, writeFile } = fsExtra;
 const { get, pick, isNumber, isBoolean, some, debounce, noop } = lodash;
 
 const log = createLogger('app/main');
@@ -177,7 +189,7 @@ let settingsChannel: SettingsChannel | undefined;
 const activeWindows = new Set<BrowserWindow>();
 
 function getMainWindow() {
-  return mainWindow;
+  return getPrimaryAccountRuntime().getWindow() ?? mainWindow;
 }
 
 const development =
@@ -241,8 +253,9 @@ const CLI_LANG = cliOptions.lang as string | undefined;
 
 setupCrashReports(log, showDebugLogWindow, FORCE_ENABLE_CRASH_REPORTS);
 
-function showWindow() {
-  if (!mainWindow) {
+function focusAccountRuntimeWindow(runtime: AccountRuntime): void {
+  const window = runtime.getWindow();
+  if (!window || window.isDestroyed()) {
     return;
   }
 
@@ -250,11 +263,51 @@ function showWindow() {
   //   has been docked using Aero Snap/Snap Assist. A full .show() call here will cause
   //   the window to reposition:
   //   https://github.com/signalapp/Signal-Desktop/issues/1429
-  if (mainWindow.isVisible()) {
-    focusAndForceToTop(mainWindow);
-  } else {
-    mainWindow.show();
+  if (window.isMinimized()) {
+    window.restore();
   }
+
+  if (window.isVisible()) {
+    focusAndForceToTop(window);
+  } else {
+    window.show();
+  }
+}
+
+async function showAccountWindow(id: string): Promise<void> {
+  let runtime = getAccountRuntimeById(id);
+  if (!runtime) {
+    if (getConfiguredSecondaryAccountIds().includes(id)) {
+      try {
+        runtime = await createSecondaryAccountRuntime(id);
+      } catch (error) {
+        log.error(
+          `showAccountWindow: Failed to open account runtime ${id}`,
+          Errors.toLogFormat(error)
+        );
+      }
+      return;
+    }
+  }
+
+  if (mainWindow && runtime) {
+    drop(reloadMainWindowForAccountRuntime(runtime));
+    return;
+  }
+
+  if (runtime) {
+    focusAccountRuntimeWindow(runtime);
+  } else {
+    log.warn(`showAccountWindow: No configured account runtime found for ${id}`);
+  }
+}
+
+function showWindow() {
+  if (!mainWindow) {
+    return;
+  }
+
+  focusAccountRuntimeWindow(getPrimaryAccountRuntime());
 }
 
 if (!process.mas) {
@@ -311,6 +364,21 @@ let sqlInitTimeEnd = 0;
 
 const sql = new MainSQL();
 const heicConverter = getHeicConverter();
+
+const primaryAccountRuntime = registerPrimaryAccountRuntime(
+  createAccountRuntime({
+    id: process.env.NODE_APP_INSTANCE || 'primary',
+    label: process.env.NODE_APP_INSTANCE || packageJson.productName,
+    appInstance: process.env.NODE_APP_INSTANCE || undefined,
+    storageProfile: config.has('storageProfile')
+      ? String(config.get('storageProfile'))
+      : undefined,
+    userDataPath: app.getPath('userData'),
+    userConfig: userConfig.userConfig,
+    ephemeralConfig: ephemeralConfig.ephemeralConfig,
+    sql,
+  })
+);
 
 async function getSpellCheckSetting(): Promise<boolean> {
   const value = ephemeralConfig.get('spell-check');
@@ -772,6 +840,8 @@ async function createWindow() {
 
   // Create the browser window.
   mainWindow = new BrowserWindow(windowOptions);
+  registerAccountWindow(primaryAccountRuntime, mainWindow);
+
   if (settingsChannel) {
     settingsChannel.setMainWindow(mainWindow);
   }
@@ -1053,14 +1123,152 @@ async function createWindow() {
   );
 }
 
-// Renderer asks if we are done with the database
-ipc.handle('database-ready', async () => {
-  if (!sqlInitPromise) {
-    log.error('database-ready requested, but sqlInitPromise is falsey');
+const SECONDARY_ACCOUNT_WINDOWS_ENV = 'SIGNAL_MULTI_ACCOUNT_WINDOWS';
+const SECONDARY_ACCOUNT_DIR = 'account-runtimes';
+const ACCOUNT_RUNTIME_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
+let configuredSecondaryAccountWindowsOpened = false;
+
+function getConfiguredSecondaryAccountIds(): ReadonlyArray<string> {
+  return (process.env[SECONDARY_ACCOUNT_WINDOWS_ENV] ?? '')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean);
+}
+
+function assertAccountRuntimeId(id: string): void {
+  if (!ACCOUNT_RUNTIME_ID_PATTERN.test(id)) {
+    throw new Error(
+      `Invalid account runtime id "${id}". Use letters, numbers, "_" or "-".`
+    );
+  }
+}
+
+function getSecondaryAccountUserDataPath(id: string): string {
+  return join(app.getPath('userData'), SECONDARY_ACCOUNT_DIR, id);
+}
+
+async function createSecondaryAccountRuntime(id: string): Promise<AccountRuntime> {
+  assertAccountRuntimeId(id);
+
+  const existingRuntime = getAccountRuntimeById(id);
+  if (existingRuntime) {
+    return existingRuntime;
+  }
+
+  const userDataPath = getSecondaryAccountUserDataPath(id);
+  await ensureDir(userDataPath);
+
+  const runtime = registerAccountRuntime(
+    createAccountRuntime({
+      id,
+      label: id,
+      appInstance: id,
+      storageProfile: id,
+      userDataPath,
+      userConfig: startConfig({
+        name: `user:${id}`,
+        targetPath: join(userDataPath, 'config.json'),
+        throwOnFilesystemErrors: true,
+      }),
+      ephemeralConfig: startConfig({
+        name: `ephemeral:${id}`,
+        targetPath: join(userDataPath, 'ephemeral.json'),
+        throwOnFilesystemErrors: false,
+      }),
+      sql: new MainSQL(),
+    })
+  );
+
+  setSQLInitPromise(runtime, initializeSQL(runtime));
+  addSensitivePath(userDataPath);
+
+  return runtime;
+}
+
+async function openConfiguredSecondaryAccountWindows(): Promise<void> {
+  if (configuredSecondaryAccountWindowsOpened) {
     return;
   }
 
-  const { error } = await sqlInitPromise;
+  configuredSecondaryAccountWindowsOpened = true;
+
+  // Secondary account ids are exposed to the renderer for in-page switching.
+  // We create runtimes eagerly so menu/UI can list them, but keep one
+  // BrowserWindow and switch it between runtimes on demand.
+  await ensureConfiguredSecondaryAccountRuntimes();
+
+  if (menuOptions) {
+    setupMenu();
+  }
+}
+
+async function ensureConfiguredSecondaryAccountRuntimes(): Promise<void> {
+  for (const id of getConfiguredSecondaryAccountIds()) {
+    if (id === primaryAccountRuntime.id) {
+      continue;
+    }
+
+    try {
+      log.info(`Preparing secondary account runtime: ${id}`);
+      // oxlint-disable-next-line no-await-in-loop
+      await createSecondaryAccountRuntime(id);
+    } catch (error) {
+      log.error(
+        `Failed to prepare secondary account runtime: ${id}`,
+        Errors.toLogFormat(error)
+      );
+    }
+  }
+}
+
+async function reloadMainWindowForAccountRuntime(
+  runtime: AccountRuntime
+): Promise<void> {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return;
+  }
+
+  setAccountRuntimeForWindow(runtime, mainWindow);
+  mainWindow.setTitle(`${packageJson.productName} - ${runtime.label}`);
+  await safeLoadURL(
+    mainWindow,
+    getEnvironment() === Environment.Test
+      ? await prepareFileUrl([rootDir, 'test', 'index.html'])
+      : await prepareFileUrl([rootDir, 'background.html'])
+  );
+}
+
+type RendererAccountRuntimeInfo = Readonly<{
+  id: string;
+  label: string;
+  isActive: boolean;
+}>;
+
+function getRendererAccountRuntimes(
+  activeRuntime: AccountRuntime
+): ReadonlyArray<RendererAccountRuntimeInfo> {
+  return getAccountMenuItems().map(account => {
+    const runtime = getAccountRuntimeById(account.id);
+    return {
+      id: account.id,
+      label: runtime?.label ?? account.label,
+      isActive: account.id === activeRuntime.id,
+    };
+  });
+}
+
+// Renderer asks if we are done with the database
+ipc.handle('database-ready', async event => {
+  const runtime = getAccountRuntimeForEvent(event);
+  const runtimeSqlInitPromise = getSQLInitPromise(runtime);
+  if (!runtimeSqlInitPromise) {
+    log.error(
+      `database-ready requested, but sqlInitPromise is falsey for ${runtime.id}`
+    );
+    return;
+  }
+
+  const { error } = await runtimeSqlInitPromise;
   if (error) {
     log.error(
       'database-ready requested, but got sql error',
@@ -1070,6 +1278,34 @@ ipc.handle('database-ready', async () => {
   }
 
   log.info('sending `database-ready`');
+});
+
+ipc.handle('accounts:get-runtimes', event => {
+  return getRendererAccountRuntimes(getAccountRuntimeForEvent(event));
+});
+
+ipc.handle('accounts:switch-runtime', async (event, id: string) => {
+  const currentRuntime = getAccountRuntimeForEvent(event);
+  if (currentRuntime.id === id) {
+    return getRendererAccountRuntimes(currentRuntime);
+  }
+
+  let runtime = getAccountRuntimeById(id);
+  if (!runtime) {
+    if (!getConfiguredSecondaryAccountIds().includes(id)) {
+      throw new Error(`Unknown account runtime: ${id}`);
+    }
+
+    runtime = await createSecondaryAccountRuntime(id);
+  }
+
+  const initResult = await getSQLInitPromise(runtime);
+  if (!initResult || initResult.error) {
+    throw initResult?.error ?? new Error(`Account runtime is not ready: ${id}`);
+  }
+
+  await reloadMainWindowForAccountRuntime(runtime);
+  return getRendererAccountRuntimes(runtime);
 });
 
 ipc.handle(
@@ -1609,31 +1845,31 @@ function showPermissionsPopupWindow(forCalling: boolean, forCamera: boolean) {
   });
 }
 
-const runSQLCorruptionHandler = async () => {
+const runSQLCorruptionHandler = async (runtime: AccountRuntime) => {
   // This is a glorified event handler. Normally, this promise never resolves,
   // but if there is a corruption error triggered by any query that we run
   // against the database - the promise will resolve and we will call
   // `onDatabaseInitializationError`.
-  const error = await sql.whenCorrupted();
+  const error = await runtime.sql.whenCorrupted();
 
   log.error(
     'Detected sql corruption in main process. ' +
       `Restarting the application immediately. Error: ${error.message}`
   );
 
-  await onDatabaseInitializationError(error);
+  await onDatabaseInitializationError(runtime, error);
 };
 
-const runSQLReadonlyHandler = async () => {
+const runSQLReadonlyHandler = async (runtime: AccountRuntime) => {
   // This is a glorified event handler. Normally, this promise never resolves,
   // but if there is a corruption error triggered by any query that we run
   // against the database - the promise will resolve and we will call
   // `onDatabaseInitializationError`.
-  const error = await sql.whenReadonly();
+  const error = await runtime.sql.whenReadonly();
 
   log.error(`Detected readonly sql database in main process: ${error.message}`);
 
-  throw error;
+  await onDatabaseInitializationError(runtime, error);
 };
 
 function generateSQLKey(): string {
@@ -1644,13 +1880,13 @@ function generateSQLKey(): string {
   return randomBytes(32).toString('hex');
 }
 
-function getSQLKey(): string {
+function getSQLKey(runtimeUserConfig: AccountRuntime['userConfig']): string {
   let update = false;
   const isLinux = OS.isLinux();
-  const legacyKeyValue = userConfig.get('key');
-  const modernKeyValue = userConfig.get('encryptedKey');
+  const legacyKeyValue = runtimeUserConfig.get('key');
+  const modernKeyValue = runtimeUserConfig.get('encryptedKey');
   const previousBackend = isLinux
-    ? userConfig.get('safeStorageBackend')
+    ? runtimeUserConfig.get('safeStorageBackend')
     : undefined;
 
   const safeStorageBackend: string | undefined = isLinux
@@ -1696,10 +1932,10 @@ function getSQLKey(): string {
       if (key === legacyKeyValue) {
         // Confirmed roundtrip encryption, we can remove the legacy key
         log.info('getSQLKey: removing legacy key');
-        userConfig.set('key', undefined);
+        runtimeUserConfig.set('key', undefined);
       } else {
         log.warn('getSQLKey: decrypted modern key mismatch with legacy key');
-        const nextStep = handleSafeStorageDecryptionError();
+        const nextStep = handleSafeStorageDecryptionError(runtimeUserConfig);
         if (nextStep === 'quit') {
           throw new SafeStorageDecryptionError();
         }
@@ -1710,7 +1946,7 @@ function getSQLKey(): string {
 
     if (isLinux && previousBackend == null) {
       log.info(`getSQLKey: saving safeStorageBackend: ${safeStorageBackend}`);
-      userConfig.set('safeStorageBackend', safeStorageBackend);
+      runtimeUserConfig.set('safeStorageBackend', safeStorageBackend);
     }
   } else if (typeof legacyKeyValue === 'string') {
     key = legacyKeyValue;
@@ -1733,24 +1969,24 @@ function getSQLKey(): string {
   if (isEncryptionAvailable) {
     log.info('getSQLKey: updating encrypted key in the config');
     const encrypted = safeStorage.encryptString(key).toString('hex');
-    userConfig.set('encryptedKey', encrypted);
+    runtimeUserConfig.set('encryptedKey', encrypted);
 
     if (OS.isFlatpak()) {
       log.info(
         'getSQLKey: updating plaintext key in the config, will confirm decryption on next start'
       );
-      userConfig.set('key', key);
+      runtimeUserConfig.set('key', key);
     } else {
-      userConfig.set('key', undefined);
+      runtimeUserConfig.set('key', undefined);
     }
 
     if (isLinux && safeStorageBackend) {
       log.info(`getSQLKey: saving safeStorageBackend: ${safeStorageBackend}`);
-      userConfig.set('safeStorageBackend', safeStorageBackend);
+      runtimeUserConfig.set('safeStorageBackend', safeStorageBackend);
     }
   } else {
     log.info('getSQLKey: updating plaintext key in the config');
-    userConfig.set('key', key);
+    runtimeUserConfig.set('key', key);
   }
 
   return key;
@@ -1758,8 +1994,10 @@ function getSQLKey(): string {
 
 // In Flatpak, safeStorage encryption may appear to work on the first run but on
 // subsequent starts the decrypted value may be incorrect.
-function handleSafeStorageDecryptionError(): 'continue' | 'quit' {
-  const previousError = userConfig.get('safeStorageDecryptionError');
+function handleSafeStorageDecryptionError(
+  runtimeUserConfig: AccountRuntime['userConfig']
+): 'continue' | 'quit' {
+  const previousError = runtimeUserConfig.get('safeStorageDecryptionError');
   if (typeof previousError === 'string') {
     return 'continue';
   }
@@ -1787,22 +2025,30 @@ function handleSafeStorageDecryptionError(): 'continue' | 'quit' {
     return 'quit';
   }
 
-  userConfig.set('safeStorageDecryptionError', 'true');
+  runtimeUserConfig.set('safeStorageDecryptionError', 'true');
   return 'continue';
 }
 
+type SQLInitializationResult =
+  | { ok: true; error: undefined }
+  | { ok: false; error: Error };
+
 async function initializeSQL(
-  userDataPath: string
-): Promise<{ ok: true; error: undefined } | { ok: false; error: Error }> {
-  sqlInitTimeStart = Date.now();
+  runtime: AccountRuntime
+): Promise<SQLInitializationResult> {
+  const { sql: runtimeSql, userDataPath } = runtime;
+  const isPrimaryRuntime = runtime.id === primaryAccountRuntime.id;
+  if (isPrimaryRuntime) {
+    sqlInitTimeStart = Date.now();
+  }
 
   let key: string;
   try {
-    key = getSQLKey();
+    key = getSQLKey(runtime.userConfig);
   } catch (error) {
     try {
       // Initialize with *some* key to setup paths
-      await sql.initialize({
+      await runtimeSql.initialize({
         appVersion: app.getVersion(),
         configDir: userDataPath,
         key: 'abcd',
@@ -1826,7 +2072,7 @@ async function initializeSQL(
     // This should be the first awaited call in this function, otherwise
     // `sql.sqlRead` will throw an uninitialized error instead of waiting for
     // init to finish.
-    await sql.initialize({
+    await runtimeSql.initialize({
       appVersion: app.getVersion(),
       configDir: userDataPath,
       key,
@@ -1843,28 +2089,40 @@ async function initializeSQL(
       error: new Error(`initializeSQL: Caught a non-error '${error}'`),
     };
   } finally {
-    sqlInitTimeEnd = Date.now();
+    if (isPrimaryRuntime) {
+      sqlInitTimeEnd = Date.now();
+    }
   }
 
-  sql.startTrackingQueryStats();
+  runtimeSql.startTrackingQueryStats();
 
   // Only if we've initialized things successfully do we set up the corruption handler
-  drop(runSQLCorruptionHandler());
-  drop(runSQLReadonlyHandler());
+  drop(runSQLCorruptionHandler(runtime));
+  drop(runSQLReadonlyHandler(runtime));
 
-  sql.onUnknownSqlError(onUnknownSqlError);
+  runtimeSql.onUnknownSqlError(error => onUnknownSqlError(runtime, error));
 
   return { ok: true, error: undefined };
 }
 
-function onUnknownSqlError(error: Error) {
+function onUnknownSqlError(runtime: AccountRuntime, error: Error) {
   log.error('Unknown SQL Error:', Errors.toLogFormat(error));
-  if (mainWindow) {
-    mainWindow.webContents.send('sql-error');
-  }
+  runtime.getWindow()?.webContents.send('sql-error');
 }
 
-const onDatabaseInitializationError = async (error: Error) => {
+const onDatabaseInitializationError = async (
+  runtime: AccountRuntime,
+  error: Error
+) => {
+  if (runtime.id !== primaryAccountRuntime.id) {
+    log.error(
+      `Database initialization failed for account runtime ${runtime.id}`,
+      Errors.toLogFormat(error)
+    );
+    runtime.getWindow()?.close();
+    return;
+  }
+
   // Prevent window from re-opening
   ready = false;
 
@@ -1974,8 +2232,8 @@ const onDatabaseInitializationError = async (error: Error) => {
 
     if (confirmationButtonIndex === confirmDeleteAllDataButtonIndex) {
       log.error('onDatabaseInitializationError: Deleting all data');
-      await sql.removeDB();
-      userConfig.remove();
+      await runtime.sql.removeDB();
+      runtime.userConfig.remove();
       log.error(
         'onDatabaseInitializationError: Requesting immediate restart after quit'
       );
@@ -1993,9 +2251,27 @@ const onDatabaseInitializationError = async (error: Error) => {
   app.exit(1);
 };
 
-let sqlInitPromise:
-  | Promise<{ ok: true; error: undefined } | { ok: false; error: Error }>
-  | undefined;
+let sqlInitPromise: Promise<SQLInitializationResult> | undefined;
+const sqlInitPromisesByRuntimeId = new Map<
+  string,
+  Promise<SQLInitializationResult>
+>();
+
+function setSQLInitPromise(
+  runtime: AccountRuntime,
+  promise: Promise<SQLInitializationResult>
+): void {
+  sqlInitPromisesByRuntimeId.set(runtime.id, promise);
+  if (runtime.id === primaryAccountRuntime.id) {
+    sqlInitPromise = promise;
+  }
+}
+
+function getSQLInitPromise(
+  runtime: AccountRuntime
+): Promise<SQLInitializationResult> | undefined {
+  return sqlInitPromisesByRuntimeId.get(runtime.id);
+}
 
 ipc.on('database-readonly', (_event: Electron.Event, error: string) => {
   // Just let global_errors.ts handle it
@@ -2122,7 +2398,7 @@ app.on('ready', async () => {
     });
   }
 
-  sqlInitPromise = initializeSQL(userDataPath);
+  setSQLInitPromise(primaryAccountRuntime, initializeSQL(primaryAccountRuntime));
 
   // First run: configure Signal to minimize to tray. Additionally, on Windows
   // enable auto-start with start-in-tray so that starting from a Desktop icon
@@ -2211,6 +2487,8 @@ app.on('ready', async () => {
       processedCount,
       messagesPerSec,
     });
+
+    drop(openConfiguredSecondaryAccountWindows());
   });
 
   addSensitivePath(userDataPath);
@@ -2326,10 +2604,13 @@ app.on('ready', async () => {
   // Initialize IPC channels before creating the window
 
   attachmentChannel.initialize({
-    sql,
-    configDir: userDataPath,
+    getDefaultRuntime: getPrimaryAccountRuntime,
+    getRuntimeById: getAccountRuntimeById,
+    getRuntimeForEvent: getAccountRuntimeForEvent,
   });
-  sqlChannels.initialize(sql);
+  sqlChannels.initialize({
+    getRuntimeForEvent: getAccountRuntimeForEvent,
+  });
   PowerChannel.initialize({
     send(event) {
       if (!mainWindow) {
@@ -2344,11 +2625,12 @@ app.on('ready', async () => {
   // Run window preloading in parallel with database initialization.
   await createWindow();
 
+  strictAssert(sqlInitPromise != null, 'sqlInitPromise must be initialized');
   const { error: sqlError } = await sqlInitPromise;
   if (sqlError) {
     log.error('sql.initialize was unsuccessful; returning early');
 
-    await onDatabaseInitializationError(sqlError);
+    await onDatabaseInitializationError(primaryAccountRuntime, sqlError);
 
     return;
   }
@@ -2385,7 +2667,44 @@ app.on('ready', async () => {
     'sql/db.sqlite-wal',
     'sql/db.sqlite-shm',
   ]);
+
+  await openConfiguredSecondaryAccountWindows();
 });
+
+function getAccountMenuItems(): CreateTemplateOptionsType['accounts'] {
+  const accountIds = [
+    primaryAccountRuntime.id,
+    ...getConfiguredSecondaryAccountIds(),
+  ];
+  const seenAccountIds = new Set<string>();
+
+  return accountIds
+    .filter(id => {
+      if (seenAccountIds.has(id)) {
+        return false;
+      }
+
+      seenAccountIds.add(id);
+      return true;
+    })
+    .map((id, index) => {
+      const runtime = getAccountRuntimeById(id);
+      const shortcutNumber = index + 1;
+      const item = {
+        id,
+        label: runtime?.label ?? id,
+      };
+
+      if (shortcutNumber <= 9) {
+        return {
+          ...item,
+          accelerator: `CommandOrControl+Alt+${shortcutNumber}`,
+        };
+      }
+
+      return item;
+    });
+}
 
 function setupMenu(options?: Partial<CreateTemplateOptionsType>) {
   const { platform } = process;
@@ -2403,6 +2722,7 @@ function setupMenu(options?: Partial<CreateTemplateOptionsType>) {
     isNightly: isNightly(version),
     isProduction: isProduction(version),
     platform: platformForMenu,
+    accounts: getAccountMenuItems(),
 
     // actions
     forceUpdate,
@@ -2427,6 +2747,7 @@ function setupMenu(options?: Partial<CreateTemplateOptionsType>) {
       }
       settingsChannel.openSettingsTab();
     },
+    showAccount: showAccountWindow,
     showWindow,
     zoomIn,
     zoomOut,
@@ -2656,7 +2977,7 @@ function getProtocolClientRegistration():
 
   return {
     path: process.execPath,
-    args: [resolve(appPath)],
+    args: [resolvePath(appPath)],
   };
 }
 
@@ -2882,6 +3203,8 @@ function removeDarkOverlay() {
 }
 
 ipc.on('get-config', async event => {
+  const accountRuntime = getAccountRuntimeForEvent(event);
+  const accountWindow = accountRuntime.getWindow();
   const theme = await getResolvedThemeSetting();
 
   const directoryConfig = safeParseLoose(directoryConfigSchema, {
@@ -2933,7 +3256,8 @@ ipc.on('get-config', async event => {
     hostname: os.hostname(),
     osRelease: os.release(),
     osVersion: os.version(),
-    appInstance: process.env.NODE_APP_INSTANCE || undefined,
+    accountRuntimeId: accountRuntime.id,
+    appInstance: accountRuntime.appInstance,
     proxyUrl: process.env.HTTPS_PROXY || process.env.https_proxy || undefined,
     contentProxyUrl: config.get<string>('contentProxyUrl'),
     sfuUrl: config.get('sfuUrl'),
@@ -2951,13 +3275,13 @@ ipc.on('get-config', async event => {
     crashDumpsPath: app.getPath('crashDumps'),
     homePath: app.getPath('home'),
     installPath: rootDir,
-    userDataPath: app.getPath('userData'),
+    userDataPath: accountRuntime.userDataPath,
 
     directoryConfig: directoryConfig.data,
 
     // Only used by the main window
-    isMainWindowFullScreen: Boolean(mainWindow?.isFullScreen()),
-    isMainWindowMaximized: Boolean(mainWindow?.isMaximized()),
+    isMainWindowFullScreen: Boolean(accountWindow?.isFullScreen()),
+    isMainWindowMaximized: Boolean(accountWindow?.isMaximized()),
 
     // Only for tests
     argv: JSON.stringify(process.argv),
@@ -3025,7 +3349,7 @@ ipc.handle('DebugLogs.upload', async (_event, content: string) => {
 
 ipc.on('get-user-data-path', event => {
   // oxlint-disable-next-line no-param-reassign
-  event.returnValue = app.getPath('userData');
+  event.returnValue = getAccountRuntimeForEvent(event).userDataPath;
 });
 
 // Refresh the settings window whenever preferences change
@@ -3394,6 +3718,7 @@ ipc.handle('getMenuOptions', async () => {
     isNightly: menuOptions?.isNightly ?? false,
     isProduction: menuOptions?.isProduction ?? true,
     platform: menuOptions?.platform ?? 'unknown',
+    accounts: getAccountMenuItems(),
   };
 });
 

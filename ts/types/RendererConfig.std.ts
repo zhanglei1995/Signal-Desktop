@@ -28,6 +28,7 @@ export const directoryConfigSchema = z.object({
 export type DirectoryConfigType = z.infer<typeof directoryConfigSchema>;
 
 export const rendererConfigSchema = z.object({
+  accountRuntimeId: configRequiredStringSchema,
   appInstance: configOptionalStringSchema,
   appStartInitialSpellcheckSetting: z.boolean(),
   buildCreation: z.number(),

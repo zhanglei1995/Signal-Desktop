@@ -8,6 +8,7 @@ import {
   inferChunkSize,
 } from '@signalapp/libsignal-client/dist/incremental_mac.js';
 import { ipcMain, protocol } from 'electron';
+import type { WebContents } from 'electron';
 import { LRUCache } from 'lru-cache';
 import { randomBytes } from 'node:crypto';
 import { once } from 'node:events';
@@ -29,7 +30,7 @@ import {
 } from '../ts/AttachmentCrypto.node.ts';
 import * as Bytes from '../ts/Bytes.std.ts';
 import type { MessageAttachmentsCursorType } from '../ts/sql/Interface.std.ts';
-import type { MainSQL } from '../ts/sql/main.main.ts';
+import type { AccountRuntime } from './account_runtime.std.ts';
 import {
   APPLICATION_OCTET_STREAM,
   MIMETypeToString,
@@ -78,6 +79,34 @@ const log = createLogger('attachment_channel');
 
 let initialized = false;
 
+type AttachmentChannelEvent = Readonly<{ sender: WebContents }>;
+type AttachmentChannelRuntime = Pick<
+  AccountRuntime,
+  'id' | 'sql' | 'userDataPath'
+>;
+
+type AttachmentContext = Readonly<{
+  runtimeId: string;
+  userDataPath: string;
+  attachmentsDir: string;
+  stickersDir: string;
+  tempDir: string;
+  draftDir: string;
+  downloadsDir: string;
+  avatarDataDir: string;
+}>;
+
+const attachmentContexts = new Map<string, AttachmentContext>();
+
+let getRuntimeForEvent:
+  | ((event: AttachmentChannelEvent) => AttachmentChannelRuntime)
+  | undefined;
+let getRuntimeById:
+  | ((runtimeId: string) => AttachmentChannelRuntime | undefined)
+  | undefined;
+let getDefaultRuntime: (() => AttachmentChannelRuntime) | undefined;
+
+const ACCOUNT_RUNTIME_ID_PARAM = 'accountRuntimeId';
 const ERASE_ATTACHMENTS_KEY = 'erase-attachments';
 const ERASE_STICKERS_KEY = 'erase-stickers';
 const ERASE_TEMP_KEY = 'erase-temp';
@@ -281,12 +310,12 @@ const dispositionSchema = z.enum([
 type DeleteOrphanedAttachmentsOptionsType = Readonly<{
   orphanedAttachments: Set<string>;
   orphanedDownloads: Set<string>;
-  sql: MainSQL;
+  sql: AccountRuntime['sql'];
   userDataPath: string;
 }>;
 
 type CleanupOrphanedAttachmentsOptionsType = Readonly<{
-  sql: MainSQL;
+  sql: AccountRuntime['sql'];
   userDataPath: string;
   _block?: boolean;
 }>;
@@ -537,60 +566,124 @@ function deleteOrphanedAttachments({
   return runSafe();
 }
 
-let attachmentsDir: string | undefined;
-let stickersDir: string | undefined;
-let tempDir: string | undefined;
-let draftDir: string | undefined;
-let downloadsDir: string | undefined;
-let avatarDataDir: string | undefined;
+function createAttachmentContext(
+  runtime: AttachmentChannelRuntime
+): AttachmentContext {
+  return {
+    runtimeId: runtime.id,
+    userDataPath: runtime.userDataPath,
+    attachmentsDir: getAttachmentsPath(runtime.userDataPath),
+    stickersDir: getStickersPath(runtime.userDataPath),
+    tempDir: getTempPath(runtime.userDataPath),
+    draftDir: getDraftPath(runtime.userDataPath),
+    downloadsDir: getDownloadsPath(runtime.userDataPath),
+    avatarDataDir: getAvatarsPath(runtime.userDataPath),
+  };
+}
+
+function getAttachmentContext(
+  runtime: AttachmentChannelRuntime
+): AttachmentContext {
+  let context = attachmentContexts.get(runtime.id);
+  if (!context || context.userDataPath !== runtime.userDataPath) {
+    context = createAttachmentContext(runtime);
+    attachmentContexts.set(runtime.id, context);
+  }
+
+  return context;
+}
+
+function getRuntime(
+  event: AttachmentChannelEvent,
+  key: string
+): AttachmentChannelRuntime {
+  if (!getRuntimeForEvent) {
+    throw new Error(`${key}: Not yet initialized!`);
+  }
+
+  return getRuntimeForEvent(event);
+}
+
+function getDefaultAttachmentContext(): AttachmentContext {
+  if (!getDefaultRuntime) {
+    throw new Error('attachment:// handler: Not yet initialized!');
+  }
+
+  return getAttachmentContext(getDefaultRuntime());
+}
+
+function getAttachmentContextForUrl(url: URL): AttachmentContext | undefined {
+  const runtimeId = url.searchParams.get(ACCOUNT_RUNTIME_ID_PARAM);
+  if (runtimeId == null) {
+    return getDefaultAttachmentContext();
+  }
+
+  const runtime = getRuntimeById?.(runtimeId);
+  if (!runtime) {
+    log.warn(`attachment:// handler: unknown account runtime ${runtimeId}`);
+    return undefined;
+  }
+
+  return getAttachmentContext(runtime);
+}
 
 export function initialize({
-  configDir,
-  sql,
-}: {
-  configDir: string;
-  sql: MainSQL;
-}): void {
+  getDefaultRuntime: nextGetDefaultRuntime,
+  getRuntimeById: nextGetRuntimeById,
+  getRuntimeForEvent: nextGetRuntimeForEvent,
+}: Readonly<{
+  getDefaultRuntime: () => AttachmentChannelRuntime;
+  getRuntimeById: (
+    runtimeId: string
+  ) => AttachmentChannelRuntime | undefined;
+  getRuntimeForEvent: (
+    event: AttachmentChannelEvent
+  ) => AttachmentChannelRuntime;
+}>): void {
   if (initialized) {
     throw new Error('initialize: Already initialized!');
   }
   initialized = true;
 
-  attachmentsDir = getAttachmentsPath(configDir);
-  stickersDir = getStickersPath(configDir);
-  tempDir = getTempPath(configDir);
-  draftDir = getDraftPath(configDir);
-  downloadsDir = getDownloadsPath(configDir);
-  avatarDataDir = getAvatarsPath(configDir);
+  getDefaultRuntime = nextGetDefaultRuntime;
+  getRuntimeById = nextGetRuntimeById;
+  getRuntimeForEvent = nextGetRuntimeForEvent;
 
-  ipcMain.handle(ERASE_TEMP_KEY, () => {
-    strictAssert(tempDir != null, 'not initialized');
-    rmSync(tempDir);
+  ipcMain.handle(ERASE_TEMP_KEY, event => {
+    const context = getAttachmentContext(getRuntime(event, ERASE_TEMP_KEY));
+    rmSync(context.tempDir);
   });
-  ipcMain.handle(ERASE_ATTACHMENTS_KEY, () => {
-    strictAssert(attachmentsDir != null, 'not initialized');
-    rmSync(attachmentsDir, { recursive: true, force: true });
+  ipcMain.handle(ERASE_ATTACHMENTS_KEY, event => {
+    const context = getAttachmentContext(
+      getRuntime(event, ERASE_ATTACHMENTS_KEY)
+    );
+    rmSync(context.attachmentsDir, { recursive: true, force: true });
   });
-  ipcMain.handle(ERASE_STICKERS_KEY, () => {
-    strictAssert(stickersDir != null, 'not initialized');
-    rmSync(stickersDir, { recursive: true, force: true });
+  ipcMain.handle(ERASE_STICKERS_KEY, event => {
+    const context = getAttachmentContext(
+      getRuntime(event, ERASE_STICKERS_KEY)
+    );
+    rmSync(context.stickersDir, { recursive: true, force: true });
   });
-  ipcMain.handle(ERASE_DRAFTS_KEY, () => {
-    strictAssert(draftDir != null, 'not initialized');
-    rmSync(draftDir, { recursive: true, force: true });
+  ipcMain.handle(ERASE_DRAFTS_KEY, event => {
+    const context = getAttachmentContext(getRuntime(event, ERASE_DRAFTS_KEY));
+    rmSync(context.draftDir, { recursive: true, force: true });
   });
-  ipcMain.handle(ERASE_DOWNLOADS_KEY, () => {
-    strictAssert(downloadsDir != null, 'not initialized');
-    rmSync(downloadsDir, { recursive: true, force: true });
+  ipcMain.handle(ERASE_DOWNLOADS_KEY, event => {
+    const context = getAttachmentContext(
+      getRuntime(event, ERASE_DOWNLOADS_KEY)
+    );
+    rmSync(context.downloadsDir, { recursive: true, force: true });
   });
 
   ipcMain.handle(
     CLEANUP_ORPHANED_ATTACHMENTS_KEY,
-    async (_event, { _block }) => {
+    async (event, { _block }) => {
+      const runtime = getRuntime(event, CLEANUP_ORPHANED_ATTACHMENTS_KEY);
       const start = Date.now();
       await cleanupOrphanedAttachments({
-        sql,
-        userDataPath: configDir,
+        sql: runtime.sql,
+        userDataPath: runtime.userDataPath,
         _block,
       });
       const duration = Date.now() - start;
@@ -598,9 +691,10 @@ export function initialize({
     }
   );
 
-  ipcMain.handle(CLEANUP_DOWNLOADS_KEY, async () => {
+  ipcMain.handle(CLEANUP_DOWNLOADS_KEY, async event => {
+    const runtime = getRuntime(event, CLEANUP_DOWNLOADS_KEY);
     const start = Date.now();
-    await deleteStaleDownloads(configDir);
+    await deleteStaleDownloads(runtime.userDataPath);
     const duration = Date.now() - start;
     log.info(`cleanupDownloads: took ${duration}ms`);
   });
@@ -608,10 +702,19 @@ export function initialize({
   protocol.handle('attachment', handleAttachmentRequest);
 }
 
-export async function handleAttachmentRequest(req: Request): Promise<Response> {
+export async function handleAttachmentRequest(
+  req: Request,
+  attachmentContext?: AttachmentContext
+): Promise<Response> {
   const url = new URL(req.url);
   if (url.host !== 'v1' && url.host !== 'v2') {
     return new Response('Unknown host', { status: 404 });
+  }
+
+  const resolvedAttachmentContext =
+    attachmentContext ?? getAttachmentContextForUrl(url);
+  if (!resolvedAttachmentContext) {
+    return new Response('Unknown account runtime', { status: 404 });
   }
 
   // Disposition
@@ -621,32 +724,25 @@ export async function handleAttachmentRequest(req: Request): Promise<Response> {
     disposition = parseLoose(dispositionSchema, dispositionParam);
   }
 
-  strictAssert(attachmentsDir != null, 'not initialized');
-  strictAssert(tempDir != null, 'not initialized');
-  strictAssert(downloadsDir != null, 'not initialized');
-  strictAssert(draftDir != null, 'not initialized');
-  strictAssert(stickersDir != null, 'not initialized');
-  strictAssert(avatarDataDir != null, 'not initialized');
-
   let parentDir: string;
   switch (disposition) {
     case 'attachment':
-      parentDir = attachmentsDir;
+      parentDir = resolvedAttachmentContext.attachmentsDir;
       break;
     case 'download':
-      parentDir = downloadsDir;
+      parentDir = resolvedAttachmentContext.downloadsDir;
       break;
     case 'temporary':
-      parentDir = tempDir;
+      parentDir = resolvedAttachmentContext.tempDir;
       break;
     case 'draft':
-      parentDir = draftDir;
+      parentDir = resolvedAttachmentContext.draftDir;
       break;
     case 'sticker':
-      parentDir = stickersDir;
+      parentDir = resolvedAttachmentContext.stickersDir;
       break;
     case 'avatarData':
-      parentDir = avatarDataDir;
+      parentDir = resolvedAttachmentContext.avatarDataDir;
       break;
     default:
       throw missingCaseError(disposition);

@@ -7,6 +7,7 @@ import { strictAssert } from './assert.std.ts';
 import type { AttachmentType } from '../types/Attachment.std.ts';
 
 const { isNumber } = lodash;
+const ACCOUNT_RUNTIME_ID_PARAM = 'accountRuntimeId';
 
 export enum AttachmentDisposition {
   Attachment = 'attachment',
@@ -118,6 +119,12 @@ export function getLocalAttachmentUrl(
   // For weak references (e.g. copied quotes) don't error if path is missing
   if (attachment.copied) {
     url.searchParams.set('weakReference', '1');
+  }
+
+  const accountRuntimeId =
+    globalThis.window?.SignalContext?.config.accountRuntimeId;
+  if (accountRuntimeId != null) {
+    url.searchParams.set(ACCOUNT_RUNTIME_ID_PARAM, accountRuntimeId);
   }
 
   return url.toString();

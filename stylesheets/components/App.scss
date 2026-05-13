@@ -19,4 +19,90 @@
     background-color: variables.$color-gray-95;
     color: variables.$color-gray-05;
   }
+
+  &__content {
+    flex: 1 1 auto;
+    min-height: 0;
+    position: relative;
+  }
+}
+
+.AccountSwitcher {
+  align-items: center;
+  border-block-end: 1px solid variables.$color-gray-15;
+  display: flex;
+  flex: 0 0 auto;
+  gap: 4px;
+  min-height: 44px;
+  overflow-x: auto;
+  padding-block: 6px;
+  padding-inline: 12px;
+
+  .dark-theme & {
+    border-block-end-color: variables.$color-gray-75;
+  }
+
+  &__button {
+    align-items: center;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    color: inherit;
+    display: inline-flex;
+    flex: 0 0 auto;
+    font: inherit;
+    gap: 8px;
+    height: 32px;
+    max-width: 180px;
+    min-width: 0;
+    padding-inline: 8px 10px;
+
+    &:disabled {
+      cursor: default;
+    }
+
+    &:not(:disabled) {
+      cursor: pointer;
+    }
+
+    &:not(:disabled):hover {
+      background: variables.$color-gray-05;
+    }
+
+    .dark-theme &:not(:disabled):hover {
+      background: variables.$color-gray-80;
+    }
+
+    &--active {
+      background: variables.$color-ultramarine-light;
+      border-color: variables.$color-ultramarine;
+      color: variables.$color-gray-90;
+    }
+
+    .dark-theme &--active {
+      background: variables.$color-ultramarine;
+      border-color: variables.$color-ultramarine-light;
+      color: variables.$color-white;
+    }
+  }
+
+  &__avatar {
+    align-items: center;
+    background: variables.$color-ultramarine;
+    border-radius: 50%;
+    color: variables.$color-white;
+    display: inline-flex;
+    flex: 0 0 auto;
+    font-size: 12px;
+    font-weight: 600;
+    height: 20px;
+    justify-content: center;
+    width: 20px;
+  }
+
+  &__label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 }

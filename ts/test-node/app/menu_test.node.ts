@@ -27,6 +27,7 @@ const showAbout = stub();
 const showDebugLog = stub();
 const showKeyboardShortcuts = stub();
 const showSettings = stub();
+const showAccount = stub();
 const showWindow = stub();
 const stageLocalBackupForImport = stub();
 const zoomIn = stub();
@@ -238,6 +239,7 @@ describe('createTemplate', () => {
     showDebugLog,
     showKeyboardShortcuts,
     showSettings,
+    showAccount,
     showWindow,
     stageLocalBackupForImport,
     zoomIn,
@@ -255,6 +257,7 @@ describe('createTemplate', () => {
           isNightly: false,
           isProduction: true,
           platform,
+          accounts: [],
           ...actions,
         };
 
@@ -270,6 +273,7 @@ describe('createTemplate', () => {
           isNightly: false,
           isProduction: true,
           platform,
+          accounts: [],
           ...actions,
         };
 

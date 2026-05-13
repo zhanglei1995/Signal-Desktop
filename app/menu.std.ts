@@ -5,6 +5,7 @@ import lodash from 'lodash';
 
 import type { LocalizerType } from '../ts/types/I18N.std.ts';
 import type {
+  AccountMenuItemType,
   MenuListType,
   MenuOptionsType,
   MenuActionsType,
@@ -13,7 +14,11 @@ import { strictAssert } from '../ts/util/assert.std.ts';
 
 const { isString } = lodash;
 
-export type CreateTemplateOptionsType = MenuOptionsType & MenuActionsType;
+export type CreateTemplateOptionsType = MenuOptionsType &
+  MenuActionsType &
+  Readonly<{
+    accounts: ReadonlyArray<AccountMenuItemType>;
+  }>;
 
 export const createTemplate = (
   options: CreateTemplateOptionsType,
@@ -41,10 +46,12 @@ export const createTemplate = (
     showDebugLog,
     showKeyboardShortcuts,
     showSettings,
+    showAccount,
     openArtCreator,
     zoomIn,
     zoomOut,
     zoomReset,
+    accounts,
   } = options;
 
   const template: MenuListType = [
@@ -218,6 +225,21 @@ export const createTemplate = (
       ],
     },
   ];
+
+  if (accounts.length > 1) {
+    const accountMenuItems: MenuListType = accounts.map(account => ({
+      label: account.label,
+      click: () => showAccount(account.id),
+      ...(account.accelerator
+        ? { accelerator: account.accelerator }
+        : {}),
+    }));
+
+    template.push({
+      label: 'Accounts',
+      submenu: accountMenuItems,
+    });
+  }
 
   if (includeSetup) {
     const fileMenu = template[0];

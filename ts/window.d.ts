@@ -25,8 +25,15 @@ import type { WindowsNotificationData } from './services/notifications.preload.t
 import type { QueryStatsOptions } from './sql/main.main.ts';
 import type { SocketStatuses } from './textsecure/SocketManager.preload.ts';
 
+export type AccountRuntimeInfoType = Readonly<{
+  id: string;
+  label: string;
+  isActive: boolean;
+}>;
+
 export type IPCType = {
   addSetupMenuItems: () => void;
+  getAccountRuntimes: () => Promise<ReadonlyArray<AccountRuntimeInfoType>>;
   clearAllWindowsNotifications: () => Promise<void>;
   closeAbout: () => void;
   crashReports: {
@@ -54,6 +61,9 @@ export type IPCType = {
   setMediaPermissions: (value: boolean) => Promise<void>;
   setMediaCameraPermissions: (value: boolean) => Promise<void>;
   setMenuBarVisibility: (value: boolean) => void;
+  switchAccountRuntime: (
+    id: string
+  ) => Promise<ReadonlyArray<AccountRuntimeInfoType>>;
   showDebugLog: (options?: { mode?: 'submit' | 'close' }) => void;
   showCallDiagnostic: () => void;
   closeCallDiagnostic: () => void;

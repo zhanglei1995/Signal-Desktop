@@ -1,9 +1,10 @@
 // Copyright 2021 Signal Messenger, LLC
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import React, { useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import classNames from 'classnames';
 
+import type { AccountRuntimeInfoType } from '../window.d.ts';
 import type { ViewStoryActionCreatorType } from '../state/ducks/stories.preload.ts';
 import type { VerificationTransport } from '../types/VerificationTransport.std.ts';
 import { ThemeType } from '../types/Util.std.ts';
@@ -13,6 +14,66 @@ import { SmartInstallScreen } from '../state/smart/InstallScreen.preload.tsx';
 import { StandaloneRegistration } from './StandaloneRegistration.dom.tsx';
 import { usePageVisibility } from '../hooks/usePageVisibility.dom.ts';
 import { TitlebarDragArea } from './TitlebarDragArea.dom.tsx';
+
+function AccountSwitcher(): React.JSX.Element | null {
+  const [accounts, setAccounts] = useState<
+    ReadonlyArray<AccountRuntimeInfoType>
+  >([]);
+  const [switchingTo, setSwitchingTo] = useState<string | undefined>();
+
+  useEffect(() => {
+    let isMounted = true;
+
+    window.IPC.getAccountRuntimes()
+      .then(nextAccounts => {
+        if (isMounted) {
+          setAccounts(nextAccounts);
+        }
+      })
+      .catch(() => {
+        if (isMounted) {
+          setAccounts([]);
+        }
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  if (accounts.length < 2) {
+    return null;
+  }
+
+  return (
+    <div className="AccountSwitcher" role="tablist" aria-label="Accounts">
+      {accounts.map(account => (
+        <button
+          aria-selected={account.isActive}
+          className={classNames({
+            AccountSwitcher__button: true,
+            'AccountSwitcher__button--active': account.isActive,
+          })}
+          disabled={account.isActive || switchingTo != null}
+          key={account.id}
+          onClick={() => {
+            setSwitchingTo(account.id);
+            window.IPC.switchAccountRuntime(account.id).catch(() => {
+              setSwitchingTo(undefined);
+            });
+          }}
+          role="tab"
+          type="button"
+        >
+          <span className="AccountSwitcher__avatar" aria-hidden="true">
+            {account.label.slice(0, 1).toUpperCase()}
+          </span>
+          <span className="AccountSwitcher__label">{account.label}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
 
 type PropsType = {
   state: AppStateType;
@@ -144,7 +205,8 @@ export function App({
         'dark-theme': theme === ThemeType.dark,
       })}
     >
-      {contents}
+      <AccountSwitcher />
+      <div className="App__content">{contents}</div>
       {renderGlobalModalContainer()}
       {renderCallManager()}
       {renderLightbox()}

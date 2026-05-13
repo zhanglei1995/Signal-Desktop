@@ -93,6 +93,7 @@ const IPC: IPCType = {
     return ipc.invoke('windows-notifications:clear-all');
   },
   closeAbout: () => ipc.send('close-about'),
+  getAccountRuntimes: () => ipc.invoke('accounts:get-runtimes'),
   crashReports: {
     getCount: () => ipc.invoke('crash-reports:get-count'),
     writeToLog: () => ipc.invoke('crash-reports:write-to-log'),
@@ -156,6 +157,8 @@ const IPC: IPCType = {
     ipc.invoke('settings:set:mediaPermissions', value),
   setMediaCameraPermissions: (value: boolean) =>
     ipc.invoke('settings:set:mediaCameraPermissions', value),
+  switchAccountRuntime: (id: string) =>
+    ipc.invoke('accounts:switch-runtime', id),
   showSettings: () => ipc.send('show-settings'),
   showWindow: () => {
     log.info('show window');
